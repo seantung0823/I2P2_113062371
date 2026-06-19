@@ -57,7 +57,6 @@ static bool is_promotion(State *state, const Move& action){
 
 /*============================================================
  * Quiescence 只搜尋 noisy move
- *
  * noisy move:
  * 1. 吃子
  * 2. 升變
@@ -562,7 +561,6 @@ int submission::eval_ctx(
     history.pop(state->hash());
     return best_score;
 }
-
 
 /*============================================================
  * MiniMax — search
