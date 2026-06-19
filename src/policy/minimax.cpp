@@ -6,10 +6,7 @@
 /*============================================================
  * MiniMax — eval_ctx
  *
- * Alpha-Beta Pruning version.
- * 你的程式原本是 Negamax，所以不需要 maximizingPlayer。
- * alpha = 目前已知最好下界
- * beta  = 對手能接受的上界
+ * Negamax without pruning. Caller manages memory.
  *============================================================*/
 int MiniMax::eval_ctx(
     State *state,
@@ -17,9 +14,7 @@ int MiniMax::eval_ctx(
     GameHistory& history,
     int ply,
     SearchContext& ctx,
-    const MMParams& p,
-    int alpha,
-    int beta
+    const MMParams& p
 ){
     ctx.nodes++;
     if(ply > ctx.seldepth){
@@ -36,9 +31,11 @@ int MiniMax::eval_ctx(
 
     /* === Terminal / leaf checks === */
 
-    // 勝利局面：越快贏越好，所以扣 ply
+    // [ Hackathon TODO 3-1 ]
+    // return the score for a winning terminal state
+    // Hint: prefer faster wins by using ply.
     if(state->game_state == WIN){
-        return P_MAX - ply;
+        return P_MAX - ply; // ply 從最初局面往下搜尋了幾步
     }
 
     if(state->game_state == DRAW){
@@ -55,49 +52,37 @@ int MiniMax::eval_ctx(
     if(depth <= 0){
         int score = state->evaluate(
             p.use_kp_eval, p.use_eval_mobility, &history
-        );
+        ); 
         history.pop(state->hash());
         return score;
     }
 
-    /* === Alpha-Beta loop === */
+    /* === Negamax loop === */
     int best_score = M_MAX;
 
     for(auto& action : state->legal_actions){
-        State *next = state->next_state(action);
+        // [ Hackathon TODO 3-2 ]
+        // create the child state after applying action
+        State *next = state -> next_state(action);
 
         bool same = next->same_player_as_parent();
 
-        int raw;
-        int score;
+        // [Hackathon TODO 3-3]
+        // search the child one level deeper
+        int raw = eval_ctx(next, depth - 1, history, ply + 1, ctx, p);
 
-        if(same){
-            // 如果下一層還是同一個玩家，分數方向不用反轉
-            raw = eval_ctx(next, depth - 1, history, ply + 1, ctx, p, alpha, beta);
-            score = raw;
-        }else{
-            // 如果換對手走，分數方向要反轉，所以 alpha/beta 也要反過來
-            raw = eval_ctx(next, depth - 1, history, ply + 1, ctx, p, -beta, -alpha);
-            score = -raw;
-        }
+        // [Hackathon TODO 3-4]
+        // convert raw to the current player's perspective.
+        int score = same ? raw : -raw; // 自己得到的局面、對手的局面
 
         delete next;
 
-        // value := max(value, child_score)
+        // [ Hackathon TODO 3-5 ]
+        // update best_score if this child is better.
         if(score > best_score){
             best_score = score;
         }
 
-        // alpha := max(alpha, value)
-        if(best_score > alpha){
-            alpha = best_score;
-        }
-
-        // if alpha >= beta then break
-        // 這就是 beta cutoff：後面的 child 不用看了
-        if(alpha >= beta){
-            break;
-        }
     }
 
     history.pop(state->hash());
@@ -125,78 +110,58 @@ SearchResult MiniMax::search(
         state->get_legal_actions();
     }
 
-    int best_score = M_MAX;
-    int alpha = M_MAX;
-    int beta = P_MAX;
 
+    int best_score = M_MAX - 10;
     int move_index = 0;
     int total_moves = (int)state->legal_actions.size();
 
     for(auto& action : state->legal_actions){
-        State* next = state->next_state(action);
+        /* [ Hackathon TODO 4-1 ]
+         * search this move like TODO 3, but starting from the root */
+            State* next = state->next_state(action);
 
-        bool same = next->same_player_as_parent();
+            bool same = next->same_player_as_parent();
 
-        int raw;
-        int score;
-
-        if(same){
-            raw = eval_ctx(
+            int raw = eval_ctx(
                 next,
                 depth - 1,
                 history,
                 1,
                 ctx,
-                p,
-                alpha,
-                beta
+                p
             );
-            score = raw;
-        }else{
-            raw = eval_ctx(
-                next,
-                depth - 1,
-                history,
-                1,
-                ctx,
-                p,
-                -beta,
-                -alpha
-            );
-            score = -raw;
-        }
 
-        delete next;
-
-        if(score > best_score){
-            best_score = score;
-            result.best_move = action;
-
-            if(p.report_partial && ctx.on_root_update){
-                ctx.on_root_update({result.best_move, best_score, depth, move_index + 1, total_moves});
+            int score;
+            if(same){
+                score = raw;
+            }else{
+                score = -raw;
             }
-        }
 
-        // root 這層也要更新 alpha，後面的 move 才能剪枝
-        if(best_score > alpha){
-            alpha = best_score;
-        }
+            delete next;
 
-        // 通常 beta 一開始是 P_MAX，所以 root 不太會剪，
-        // 但保留這行是完整的 Alpha-Beta 寫法。
-        if(alpha >= beta){
-            break;
-        }
+            if(score > best_score){
+                // [ Hackathon TODO 4-2 ]
+                // keep this move if it is the best so far
 
+                best_score = score;
+                result.best_move = action;
+
+                if(p.report_partial && ctx.on_root_update){
+                   ctx.on_root_update({result.best_move, best_score, depth, move_index + 1, total_moves});
+                }
+            }  
         move_index++;
     }
 
-    result.score = best_score;
-    result.nodes = ctx.nodes;
-    result.seldepth = ctx.seldepth;
+    // [ Hackathon TODO 4-3 ]
+    // update result and return
+        result.score = best_score;
+        result.nodes = ctx.nodes;
+        result.seldepth = ctx.seldepth;
 
-    return result;
-}
+        return result;
+} 
 
 
 /*============================================================

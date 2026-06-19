@@ -16,7 +16,7 @@ struct MMParams {
     }
 };
 
-class MiniMax{
+class submission{
 public:
     static int eval_ctx(
         State *state,
@@ -24,7 +24,9 @@ public:
         GameHistory& history,
         int ply,
         SearchContext& ctx,
-        const MMParams& p
+        const MMParams& p,
+        int alpha,
+        int beta
     );
     static SearchResult search(
         State *state,
