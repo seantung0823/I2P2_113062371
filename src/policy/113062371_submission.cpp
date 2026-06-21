@@ -2,6 +2,8 @@
 #include <iostream>
 #include <algorithm>
 #include <vector>
+#include <unordered_map>
+#include <cstdint>
 #include "state.hpp"
 #include "submission.hpp"
 
@@ -22,7 +24,6 @@ static const int MAX_Q_DEPTH = 4;
  * Move = pair<Point, Point>
  * action.first  = from
  * action.second = to
- *
  * 如果目標格有對手棋子，就是 capture。
  *============================================================*/
 static bool is_capture(State *state, const Move& action){
@@ -210,13 +211,17 @@ static int quiescence(
 /*============================================================
  * MiniMax — eval_ctx
  *
- * PVS + Alpha-Beta + Quiescence version.
+ * PVS + Alpha-Beta + Quiescence + TT + History version.
  *============================================================*/
 /*============================================================
  * Move ordering 強化版
  *
  * 不改 PVS / Quiescence 的核心，只讓「比較可能好的走法」
  * 排在前面，讓 PVS + Alpha-Beta 更容易剪枝、看更深。
+ *
+ * 新增：
+ * 1. Transposition Table Best Move 優先排序
+ * 2. History Heuristic quiet move 排序
  *============================================================*/
 static const int MAX_KILLER_PLY = 128;
 static Move killer_1[MAX_KILLER_PLY];
@@ -229,6 +234,153 @@ static bool same_move(const Move& a, const Move& b){
            a.first.second == b.first.second &&
            a.second.first == b.second.first &&
            a.second.second == b.second.second;
+}
+
+/*============================================================
+ * Transposition Table
+ *
+ * TT 會記住：
+ * 1. 這個盤面之前搜尋到的 score
+ * 2. 當時搜尋的 depth
+ * 3. score 是精確值 / 下界 / 上界
+ * 4. 這個盤面之前最好的 move
+ *
+ * 之後如果又遇到同一個盤面：
+ * - depth 夠深：可以直接拿來剪枝或回傳
+ * - depth 不夠：至少可以把 TT best move 排到最前面
+ *============================================================*/
+static const int TT_EXACT = 0;
+static const int TT_LOWER = 1;
+static const int TT_UPPER = 2;
+static const int TT_MAX_ENTRIES = 300000;
+
+struct TTEntry{
+    int depth;
+    int score;
+    int flag;
+    Move best_move;
+    bool has_best_move;
+};
+
+static std::unordered_map<unsigned long long, TTEntry> transposition_table;
+
+static unsigned long long tt_key(State *state){
+    /*
+     * state->hash() 已經是 Zobrist hash，並且通常已經包含輪到誰走。
+     * 直接拿它當 TT key，避免 shift 造成高位資訊被丟掉。
+     */
+    return (unsigned long long)state->hash();
+}
+
+static void maybe_clear_tt(){
+    if((int)transposition_table.size() > TT_MAX_ENTRIES){
+        transposition_table.clear();
+    }
+}
+
+static int tt_flag_from_score(int score, int alpha_original, int beta_original){
+    if(score <= alpha_original){
+        return TT_UPPER;
+    }
+    if(score >= beta_original){
+        return TT_LOWER;
+    }
+    return TT_EXACT;
+}
+
+static bool tt_probe(
+    State *state,
+    int depth,
+    int& alpha,
+    int& beta,
+    int& tt_score,
+    Move& tt_best_move,
+    bool& has_tt_best_move
+){
+    unsigned long long key = tt_key(state);
+    auto it = transposition_table.find(key);
+
+    if(it == transposition_table.end()){
+        has_tt_best_move = false;
+        return false;
+    }
+
+    const TTEntry& entry = it->second;
+
+    if(entry.has_best_move){
+        tt_best_move = entry.best_move;
+        has_tt_best_move = true;
+    }else{
+        has_tt_best_move = false;
+    }
+
+    /*
+     * depth 不夠時，不直接相信分數，
+     * 但上面的 best_move 還是可以拿去做 move ordering。
+     */
+    if(entry.depth < depth){
+        return false;
+    }
+
+    if(entry.flag == TT_EXACT){
+        tt_score = entry.score;
+        return true;
+    }
+
+    if(entry.flag == TT_LOWER){
+        if(entry.score >= beta){
+            tt_score = entry.score;
+            return true;
+        }
+        if(entry.score > alpha){
+            alpha = entry.score;
+        }
+    }else if(entry.flag == TT_UPPER){
+        if(entry.score <= alpha){
+            tt_score = entry.score;
+            return true;
+        }
+        if(entry.score < beta){
+            beta = entry.score;
+        }
+    }
+
+    if(alpha >= beta){
+        tt_score = entry.score;
+        return true;
+    }
+
+    return false;
+}
+
+static void tt_store(
+    State *state,
+    int depth,
+    int score,
+    int flag,
+    const Move& best_move,
+    bool has_best_move
+){
+    maybe_clear_tt();
+
+    unsigned long long key = tt_key(state);
+    auto it = transposition_table.find(key);
+
+    /*
+     * 如果舊資料搜尋比較深，就不要用比較淺的資料覆蓋它。
+     */
+    if(it != transposition_table.end() && it->second.depth > depth){
+        return;
+    }
+
+    TTEntry entry;
+    entry.depth = depth;
+    entry.score = score;
+    entry.flag = flag;
+    entry.best_move = best_move;
+    entry.has_best_move = has_best_move;
+
+    transposition_table[key] = entry;
 }
 
 static int piece_value(int piece){
@@ -273,7 +425,71 @@ static void save_killer(int ply, const Move& action){
     has_killer_1[ply] = true;
 }
 
-static int move_score(State *state, const Move& action, int ply){
+/*============================================================
+ * History Heuristic
+ *
+ * quiet move 如果常常造成 alpha-beta cutoff，
+ * 代表它很可能是「好招」，之後同樣 from -> to 的 quiet move 會排前面。
+ *
+ * 跟 killer move 差別：
+ * - killer move：只記同一個 ply 的兩步
+ * - history：跨整棵搜尋樹累積經驗
+ *============================================================*/
+/*
+ * 原本可以用五維陣列：
+ * history_score[side][from_r][from_c][to_r][to_c]
+ *
+ * 但有些專案裡 BOARD_H / BOARD_W 不是真正的 compile-time constant，
+ * 全域五維陣列可能會編譯失敗。
+ * 所以這裡改用 unordered_map，功能一樣，但比較穩。
+ */
+static std::unordered_map<unsigned long long, int> history_score;
+
+static unsigned long long history_key(State *state, const Move& action){
+    Point from = action.first;
+    Point to = action.second;
+
+    unsigned long long side = (unsigned long long)state->player;
+    unsigned long long fr = (unsigned long long)from.first;
+    unsigned long long fc = (unsigned long long)from.second;
+    unsigned long long tr = (unsigned long long)to.first;
+    unsigned long long tc = (unsigned long long)to.second;
+
+    return (side << 32) | (fr << 24) | (fc << 16) | (tr << 8) | tc;
+}
+
+static void save_history(State *state, const Move& action, int depth){
+    int bonus = depth * depth + 1;
+    unsigned long long key = history_key(state, action);
+
+    int& h = history_score[key];
+    h += bonus;
+
+    /* 避免分數長太大，影響排序比例。 */
+    if(h > 1000000){
+        h = 1000000;
+    }
+}
+
+static int get_history_score(State *state, const Move& action){
+    unsigned long long key = history_key(state, action);
+    auto it = history_score.find(key);
+
+    if(it == history_score.end()){
+        return 0;
+    }
+
+    int h = it->second / 16;
+
+    /* history 是 quiet move 的輔助分，不要大到蓋過吃子。 */
+    if(h > 50000){
+        h = 50000;
+    }
+
+    return h;
+}
+
+static int move_score(State *state, const Move& action, int ply, const Move *tt_best_move = nullptr){
     Point from = action.first;
     Point to = action.second;
 
@@ -286,7 +502,16 @@ static int move_score(State *state, const Move& action, int ply){
     int score = 0;
 
     /*
-     * 1. 吃王最高：這種 move 一定要最前面。
+     * 0. TT Best Move：
+     * 如果 Transposition Table 說這個盤面以前最好是這步，
+     * 直接排最前面，幫 PVS 第一個 child 更容易命中好招。
+     */
+    if(tt_best_move != nullptr && same_move(action, *tt_best_move)){
+        score += 20000000;
+    }
+
+    /*
+     * 1. 吃王最高：這種 move 一定要很前面。
      */
     if(captured_piece == 6){
         score += 10000000;
@@ -324,13 +549,21 @@ static int move_score(State *state, const Move& action, int ply){
     }
 
     /*
-     * 5. 小分數：中心控制。
+     * 5. History Heuristic：
+     * 只對 quiet move 加分，避免吃子排序被干擾。
+     */
+    if(captured_piece == 0 && !is_promotion(state, action)){
+        score += get_history_score(state, action);
+    }
+
+    /*
+     * 6. 小分數：中心控制。
      * 這不會決定勝負，只是同分時讓 move order 比較合理。
      */
     score += center_score(to);
 
     /*
-     * 6. 兵往底線附近走，稍微加分。
+     * 7. 兵往底線附近走，稍微加分。
      */
     if(moving_piece == 1){
         int dist_top = to.first;
@@ -342,11 +575,11 @@ static int move_score(State *state, const Move& action, int ply){
     return score;
 }
 
-static void order_moves(State *state, int ply){
+static void order_moves(State *state, int ply, const Move *tt_best_move = nullptr){
     std::vector< std::pair<int, Move> > scored;
 
     for(auto& action : state->legal_actions){
-        scored.push_back(std::make_pair(move_score(state, action, ply), action));
+        scored.push_back(std::make_pair(move_score(state, action, ply, tt_best_move), action));
     }
 
     std::stable_sort(
@@ -402,6 +635,26 @@ int submission::eval_ctx(
         return rep_score;
     }
 
+    int alpha_original = alpha;
+    int beta_original = beta;
+
+    /* === Transposition Table probe === */
+    int tt_score = 0;
+    Move tt_best_move;
+    bool has_tt_best_move = false;
+
+    if(tt_probe(
+        state,
+        depth,
+        alpha,
+        beta,
+        tt_score,
+        tt_best_move,
+        has_tt_best_move
+    )){
+        return tt_score;
+    }
+
     /*
      * 重點：
      * depth 到 0 時，不再直接 evaluate，
@@ -411,7 +664,7 @@ int submission::eval_ctx(
      * 因為 quiescence 裡面自己會 push/pop。
      */
     if(depth <= 0){
-        return quiescence(
+        int q_score = quiescence(
             state,
             history,
             ply,
@@ -421,14 +674,25 @@ int submission::eval_ctx(
             beta,
             MAX_Q_DEPTH
         );
+
+        int q_flag = tt_flag_from_score(q_score, alpha_original, beta_original);
+        tt_store(state, depth, q_score, q_flag, Move(), false);
+
+        return q_score;
     }
 
     history.push(state->hash());
 
-    order_moves(state, ply);
+    if(has_tt_best_move){
+        order_moves(state, ply, &tt_best_move);
+    }else{
+        order_moves(state, ply);
+    }
 
     /* === PVS loop === */
     int best_score = M_MAX;
+    Move best_move;
+    bool has_best_move = false;
     bool first_child = true;
 
     for(auto& action : state->legal_actions){
@@ -540,6 +804,8 @@ int submission::eval_ctx(
 
         if(score > best_score){
             best_score = score;
+            best_move = action;
+            has_best_move = true;
         }
 
         if(best_score > alpha){
@@ -548,15 +814,20 @@ int submission::eval_ctx(
 
         if(alpha >= beta){
             /*
-             * 這個 action 造成 cutoff，記成 killer move。
-             * 只記 quiet move，吃子本來就已經會排很前面。
+             * 這個 action 造成 cutoff。
+             * quiet move 同時記到 killer move 和 history heuristic。
              */
             if(!is_noisy(state, action)){
                 save_killer(ply, action);
+                save_history(state, action, depth);
             }
             break;
         }
     }
+
+     
+    int flag = tt_flag_from_score(best_score, alpha_original, beta_original);
+    tt_store(state, depth, best_score, flag, best_move, has_best_move);
 
     history.pop(state->hash());
     return best_score;
@@ -582,7 +853,7 @@ SearchResult submission::search(
      * 這是最直接讓 AI 變強的地方。
      * 如果你跑起來超時，就把 EXTRA_SEARCH_DEPTH 改成 0。
      */
-    static const int EXTRA_SEARCH_DEPTH = 0;
+    static const int EXTRA_SEARCH_DEPTH = 1;
     if(depth > 0){
         depth += EXTRA_SEARCH_DEPTH;
     }
@@ -609,7 +880,32 @@ SearchResult submission::search(
         return result;
     }
 
-    order_moves(state, 0);
+    /*
+     * Root 也用 TT best move 排序。
+     * 這樣 iterative deepening 或同一盤後續搜尋時，
+     * 以前找到的好走法會被排在第一個。
+     */
+    int dummy_alpha = M_MAX;
+    int dummy_beta = P_MAX;
+    int dummy_score = 0;
+    Move root_tt_best_move;
+    bool has_root_tt_best_move = false;
+
+    tt_probe(
+        state,
+        depth,
+        dummy_alpha,
+        dummy_beta,
+        dummy_score,
+        root_tt_best_move,
+        has_root_tt_best_move
+    );
+
+    if(has_root_tt_best_move){
+        order_moves(state, 0, &root_tt_best_move);
+    }else{
+        order_moves(state, 0);
+    }
 
     int best_score = M_MAX;
     int alpha = M_MAX;
@@ -727,7 +1023,7 @@ SearchResult submission::search(
 
         delete next;
 
-        int this_order_score = move_score(state, action, 0);
+        int this_order_score = move_score(state, action, 0, has_root_tt_best_move ? &root_tt_best_move : nullptr);
 
         if(score > best_score || (score == best_score && this_order_score > best_order_score)){
             best_score = score;
@@ -750,6 +1046,10 @@ SearchResult submission::search(
         }
 
         if(alpha >= beta){
+            if(!is_noisy(state, action)){
+                save_killer(0, action);
+                save_history(state, action, depth);
+            }
             break;
         }
 
@@ -760,6 +1060,9 @@ SearchResult submission::search(
     result.nodes = ctx.nodes;
     result.seldepth = ctx.seldepth;
     result.pv = {result.best_move};
+
+    /* Root 也存進 TT，之後可拿來當 TT best move。 */
+    tt_store(state, depth, best_score, TT_EXACT, result.best_move, true);
 
     return result;
 }
